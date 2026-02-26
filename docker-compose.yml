@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  orchestra:
+    build: .
+    image: openclaw-orchestra
+    container_name: orchestra
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./data:/app/data      # Agent registry + history DB (persisted)
+    environment:
+      - ORCHESTRA_PORT=9000
