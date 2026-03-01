@@ -1,299 +1,408 @@
 <!DOCTYPE html>
-<html lang="en" id="html-root">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenClaw Orchestra — The Stage</title>
+  <title>OpenClaw Orchestra</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
-<!-- ═══════════════════════════════ HEADER ═══════════════════════════════════ -->
-<header class="header">
-  <div class="header-brand">
-    <span class="header-logo">🎼</span>
-    <div>
-      <div class="header-title">OpenClaw Orchestra</div>
-      <div class="header-sub">The Stage</div>
+<!-- ══════════════════════════════════════════════════════════
+     LAYOUT: sidebar | main | activity-panel
+══════════════════════════════════════════════════════════════ -->
+<div class="shell">
+
+  <!-- ════════════════════════════ SIDEBAR ══════════════════════ -->
+  <aside class="sidebar" id="sidebar">
+
+    <div class="sb-brand">
+      <span class="sb-logo">🎼</span>
+      <div>
+        <div class="sb-title">Orchestra</div>
+        <div class="sb-sub">OpenClaw Command Centre</div>
+      </div>
     </div>
-  </div>
 
-  <div class="header-actions">
-    <div class="search-wrap">
-      <input type="text" id="search-input" class="search-box" placeholder="🔍  Find an agent…" oninput="filterCards()">
+    <!-- Search agents in sidebar -->
+    <div class="sb-search">
+      <input type="text" id="sb-search" placeholder="🔍 Find agent…" oninput="sidebarSearch(this.value)">
     </div>
-    <button class="hdr-btn" onclick="openAddWizard()">+ Add Agent</button>
-    <button class="hdr-btn hdr-btn-icon" onclick="toggleDark()" title="Toggle dark mode" id="dark-btn">🌙</button>
-  </div>
-</header>
 
-<!-- ═══════════════════════════════ SUMMARY ══════════════════════════════════ -->
-<div class="summary-bar">
-  <div class="summary-stats">
-    <div class="stat-item">
-      <span class="stat-dot green"></span>
-      <strong id="cnt-online">0</strong> online
+    <!-- Nav -->
+    <nav class="sb-nav">
+      <a class="sb-nav-item active" data-view="overview" onclick="showView('overview',this)">
+        <span class="sni-icon">⬡</span> Overview
+      </a>
+    </nav>
+
+    <div class="sb-section-label">AGENTS</div>
+
+    <!-- Agent list — populated by JS -->
+    <div class="sb-agents" id="sb-agents">
+      <div class="sb-loading">Connecting…</div>
     </div>
-    <div class="stat-item">
-      <span class="stat-dot red"></span>
-      <strong id="cnt-offline">0</strong> offline
+
+    <div class="sb-footer">
+      <button class="sb-add-btn" onclick="openWizard()">＋ Add Agent</button>
+      <div class="sb-footer-meta" id="sb-footer-meta">
+        <span id="sb-last-check" style="color:var(--muted)">Checking…</span>
+      </div>
     </div>
-    <div class="stat-item" id="last-updated" style="color:var(--muted)">
-      Connecting…
+
+  </aside>
+
+  <!-- ════════════════════════════ MAIN ════════════════════════ -->
+  <main class="main-area" id="main-area">
+
+    <!-- ── Top metric bar ──────────────────────────────────────── -->
+    <div class="metric-bar" id="metric-bar">
+      <div class="metric-tile" id="mt-online">
+        <div class="mt-val">—</div>
+        <div class="mt-label">Online</div>
+        <div class="mt-spark" id="mts-online"></div>
+      </div>
+      <div class="metric-tile" id="mt-offline">
+        <div class="mt-val">—</div>
+        <div class="mt-label">Offline</div>
+      </div>
+      <div class="metric-tile" id="mt-cost">
+        <div class="mt-val">$—</div>
+        <div class="mt-label">Spent Today</div>
+        <div class="mt-sub" id="mt-cost-sub"></div>
+      </div>
+      <div class="metric-tile" id="mt-resp">
+        <div class="mt-val">—ms</div>
+        <div class="mt-label">Avg Response</div>
+      </div>
+      <div class="metric-tile" id="mt-events">
+        <div class="mt-val">—</div>
+        <div class="mt-label">Events Today</div>
+      </div>
+      <div class="metric-bar-actions">
+        <button class="mba-btn" onclick="bulkAction('restart_all')" title="Restart all SSH agents">↺ All</button>
+        <button class="mba-btn mba-stop" onclick="bulkAction('stop_all')" title="Stop all SSH agents">⏹ All</button>
+        <button class="mba-btn mba-icon" onclick="refreshAll()" title="Force refresh">⟳</button>
+      </div>
     </div>
-  </div>
 
-  <div class="bulk-actions" id="bulk-actions" style="display:none">
-    <span style="font-size:.78rem; color:var(--muted)">All agents:</span>
-    <button class="bulk-btn" onclick="bulkAction('restart_all')">↺ Restart All</button>
-    <button class="bulk-btn bulk-stop" onclick="bulkAction('stop_all')">⏹ Stop All</button>
-  </div>
-</div>
+    <!-- ── View: Overview ──────────────────────────────────────── -->
+    <div class="view active" id="view-overview">
+      <div class="view-header">
+        <h1 class="view-title">The Stage</h1>
+        <div class="view-controls">
+          <select class="vc-select" id="group-filter" onchange="filterByGroup(this.value)">
+            <option value="all">All Groups</option>
+          </select>
+          <select class="vc-select" id="sort-by" onchange="renderOverview()">
+            <option value="name">Sort: Name</option>
+            <option value="status">Sort: Status</option>
+            <option value="cost">Sort: Cost</option>
+          </select>
+        </div>
+      </div>
 
-<!-- ═══════════════════════════════ GROUP TABS ═══════════════════════════════ -->
-<div class="group-bar">
-  <div class="group-tabs" id="group-tabs">
-    <button class="group-tab active" data-group="all" onclick="filterGroup('all', this)">All Agents</button>
-  </div>
-</div>
+      <div class="fleet-grid" id="fleet-grid"></div>
 
-<!-- ═══════════════════════════════ AGENT GRID ═══════════════════════════════ -->
-<main class="stage">
-  <div class="agent-grid" id="agent-grid"></div>
-  <div class="empty-state" id="empty-state" style="display:none">
-    <div class="empty-icon">🎼</div>
-    <h2>The stage is empty</h2>
-    <p>Add your first OpenClaw agent to start conducting.</p>
-    <button class="btn-primary" onclick="openAddWizard()" style="margin-top:1.25rem">
-      + Add Your First Agent
-    </button>
-  </div>
-</main>
+      <div class="empty-stage" id="empty-stage" style="display:none">
+        <div class="es-icon">🎼</div>
+        <h2>The stage is empty</h2>
+        <p>Add your first OpenClaw agent to start conducting.</p>
+        <button class="btn-primary" style="margin-top:1.5rem" onclick="openWizard()">＋ Add Your First Agent</button>
+      </div>
+    </div>
+
+    <!-- ── View: Agent Detail ──────────────────────────────────── -->
+    <div class="view" id="view-detail">
+
+      <div class="detail-header" id="detail-header">
+        <button class="back-btn" onclick="showView('overview')">← Back</button>
+        <div class="dh-identity">
+          <span id="dh-emoji" style="font-size:2.2rem"></span>
+          <div>
+            <div id="dh-name" style="font-size:1.4rem;font-weight:800;letter-spacing:-.02em"></div>
+            <div id="dh-desc" style="font-size:.8rem;color:var(--muted);margin-top:2px"></div>
+          </div>
+          <div id="dh-status-badge" class="status-badge"></div>
+        </div>
+        <div class="dh-controls" id="dh-controls"></div>
+      </div>
+
+      <!-- Detail stat chips -->
+      <div class="detail-chips" id="detail-chips"></div>
+
+      <!-- Detail tabs -->
+      <div class="detail-tabs">
+        <button class="dtab active" onclick="showDetailTab('overview',this)">Overview</button>
+        <button class="dtab" onclick="showDetailTab('sessions',this)">Sessions</button>
+        <button class="dtab" onclick="showDetailTab('costs',this)">Costs</button>
+        <button class="dtab" onclick="showDetailTab('logs',this)">Logs</button>
+        <button class="dtab" onclick="showDetailTab('reasoning',this)">Reasoning</button>
+        <button class="dtab" onclick="showDetailTab('config',this)">Config</button>
+        <button class="dtab" onclick="showDetailTab('settings',this)">Settings</button>
+      </div>
+
+      <!-- ── Overview tab ──────────────────────────────────────── -->
+      <div class="dtab-panel active" id="dtp-overview">
+        <div class="two-col">
+          <div class="col-main">
+            <div class="panel-section">
+              <div class="ps-label">48-Hour Uptime</div>
+              <div class="spark-full" id="d-spark"></div>
+              <div class="spark-legend">Each dot = 1 check &nbsp;·&nbsp; 🟢 online &nbsp;·&nbsp; 🔴 offline</div>
+            </div>
+            <div class="panel-section">
+              <div class="ps-label">What's happening</div>
+              <div class="activity-card" id="d-activity">Checking…</div>
+            </div>
+            <div class="panel-section">
+              <div class="ps-label">Controls</div>
+              <div class="ctrl-grid" id="d-ctrl-grid"></div>
+              <div class="job-log" id="d-job-log" style="display:none"><div id="d-job-out"></div></div>
+            </div>
+          </div>
+          <div class="col-side">
+            <div class="panel-section">
+              <div class="ps-label">Cost breakdown</div>
+              <div class="mini-cost-chart" id="d-mini-cost"></div>
+            </div>
+            <div class="panel-section">
+              <div class="ps-label">Quick links</div>
+              <div id="d-links"></div>
+            </div>
+            <div class="panel-section">
+              <div class="ps-label">Agent info</div>
+              <div class="info-list" id="d-info-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Sessions tab ──────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-sessions">
+        <div class="tab-toolbar">
+          <span class="tt-label">Active and recent conversations handled by this agent</span>
+          <button class="btn-sm" onclick="loadSessions()">🔄 Refresh</button>
+        </div>
+        <div id="sessions-content">
+          <div class="tab-placeholder">Click Refresh to load session data</div>
+        </div>
+      </div>
+
+      <!-- ── Costs tab ─────────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-costs">
+        <div class="tab-toolbar">
+          <span class="tt-label">Estimated API spend from token usage in logs</span>
+          <button class="btn-sm" onclick="loadCosts()">🔄 Refresh</button>
+        </div>
+        <div id="costs-content">
+          <div class="tab-placeholder">Click Refresh to load cost data</div>
+        </div>
+      </div>
+
+      <!-- ── Logs tab ──────────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-logs">
+        <div class="tab-toolbar">
+          <div style="display:flex;gap:.5rem;align-items:center">
+            <input type="text" class="log-filter-input" id="log-filter" placeholder="Filter logs…" oninput="filterLogs()">
+          </div>
+          <button class="btn-sm" onclick="loadLogs()">🔄 Refresh</button>
+        </div>
+        <div class="log-viewer" id="d-log-viewer">
+          <div class="log-placeholder">Click Refresh to load logs</div>
+        </div>
+      </div>
+
+      <!-- ── Reasoning tab ─────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-reasoning">
+        <div class="tab-toolbar">
+          <span class="tt-label">Extracted &lt;thinking&gt; blocks — requires reasoning enabled on the agent</span>
+          <button class="btn-sm" onclick="loadReasoning()">🔄 Refresh</button>
+        </div>
+        <div id="reasoning-content">
+          <div class="tab-placeholder">Click Refresh to extract reasoning blocks from logs</div>
+        </div>
+      </div>
+
+      <!-- ── Config tab ────────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-config">
+        <div class="tab-toolbar">
+          <span class="tt-label">Read-only view of openclaw.json on this agent</span>
+          <button class="btn-sm" onclick="loadConfig()">🔄 Load Config</button>
+        </div>
+        <pre class="config-viewer" id="d-config-viewer">Click "Load Config" to read the configuration from this agent.</pre>
+      </div>
+
+      <!-- ── Settings tab ──────────────────────────────────────── -->
+      <div class="dtab-panel" id="dtp-settings">
+        <div class="settings-form" id="d-settings-form"></div>
+        <div class="settings-actions">
+          <button class="btn-primary" onclick="saveSettings()">Save Changes</button>
+          <button class="btn-ghost" onclick="refreshCurrentAgent()">🔄 Refresh Status</button>
+          <button class="btn-ghost btn-danger" onclick="removeCurrentAgent()">Remove Agent</button>
+        </div>
+      </div>
+
+    </div> <!-- /view-detail -->
+
+  </main>
+
+  <!-- ════════════════════════════ ACTIVITY PANEL ═══════════════ -->
+  <aside class="activity-panel" id="activity-panel">
+
+    <div class="ap-header">
+      <span class="ap-title">Live Activity</span>
+      <div class="ap-controls">
+        <button class="ap-btn" onclick="toggleActivityPause()" id="ap-pause-btn" title="Pause feed">⏸</button>
+        <button class="ap-btn" onclick="clearActivity()" title="Clear">✕</button>
+      </div>
+    </div>
+
+    <div class="activity-feed" id="activity-feed">
+      <div class="af-empty">Waiting for events…</div>
+    </div>
+
+    <div class="ap-divider">
+      <span>Reasoning Viewer</span>
+      <button class="ap-btn" onclick="toggleReasoning()" id="reasoning-toggle">▾</button>
+    </div>
+
+    <div class="reasoning-panel" id="reasoning-panel">
+      <div class="reasoning-selector">
+        <select id="reasoning-agent-sel" onchange="loadReasoningPanel()" class="rs-select">
+          <option value="">— select an agent —</option>
+        </select>
+        <button class="btn-sm" onclick="loadReasoningPanel()">Load</button>
+      </div>
+      <div class="reasoning-scroll" id="reasoning-scroll">
+        <div class="rp-empty">Select an agent above to view its reasoning blocks</div>
+      </div>
+    </div>
+
+  </aside>
+
+</div> <!-- /shell -->
 
 
-<!-- ══════════════════════════════════════════════════════════════════════════
-     ADD AGENT WIZARD — 3 steps
-══════════════════════════════════════════════════════════════════════════════ -->
-<div class="overlay" id="add-overlay" onclick="closeAddWizard(event)">
+<!-- ══════════════════════════════════════════════════════════
+     ADD AGENT WIZARD
+══════════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="wizard-overlay" onclick="closeWizard(event)">
   <div class="modal" onclick="event.stopPropagation()">
 
     <div class="modal-head">
-      <h2 id="wizard-title">➕ Add an Agent</h2>
-      <button class="modal-x" onclick="closeAddWizard()">✕</button>
+      <div>
+        <h2 class="modal-title" id="wizard-title">Add an Agent</h2>
+        <div class="wizard-steps">
+          <span class="ws active" id="ws-1">1 · Who</span>
+          <span class="ws-arrow">›</span>
+          <span class="ws" id="ws-2">2 · Connection</span>
+          <span class="ws-arrow">›</span>
+          <span class="ws" id="ws-3">3 · Details</span>
+        </div>
+      </div>
+      <button class="modal-close" onclick="closeWizard()">✕</button>
     </div>
 
-    <!-- Wizard progress -->
-    <div class="wizard-steps">
-      <div class="wstep active" id="ws1"><span class="wdot">1</span> Who</div>
-      <div class="wstep" id="ws2"><span class="wdot">2</span> How</div>
-      <div class="wstep" id="ws3"><span class="wdot">3</span> Details</div>
-    </div>
-
-    <!-- Step 1: Identity -->
-    <div class="wpage active" id="wp1">
-      <p class="wdesc">Tell us about this agent so you can recognise it on the dashboard.</p>
-      <div class="fg">
-        <div class="field sm">
-          <label>Icon</label>
-          <input type="text" id="w-emoji" value="🤖" maxlength="4" style="font-size:1.4rem;text-align:center">
+    <!-- Step 1 -->
+    <div class="wizard-page active" id="wp-1">
+      <div class="form-grid">
+        <div class="fg-row">
+          <div class="field sm">
+            <label>Icon</label>
+            <input type="text" id="w-emoji" value="🤖" maxlength="4" class="emoji-input">
+          </div>
+          <div class="field" style="flex:1">
+            <label>Name <span class="req">*</span></label>
+            <input type="text" id="w-name" placeholder="e.g. Moneypenny, Max, Aria">
+          </div>
         </div>
         <div class="field">
-          <label>Agent Name <span class="req">*</span></label>
-          <input type="text" id="w-name" placeholder="e.g. Moneypenny, Max, Aria">
-          <span class="err-msg">Please give this agent a name</span>
-        </div>
-        <div class="field full">
           <label>What does this agent do?</label>
-          <input type="text" id="w-desc" placeholder="e.g. Handles finance questions for the team">
-          <span class="hint">Shown on the agent's card — plain English is perfect</span>
+          <input type="text" id="w-desc" placeholder="Finance assistant, coding helper…">
         </div>
-        <div class="field full">
+        <div class="field">
           <label>Group</label>
           <input type="text" id="w-group" value="default" placeholder="default">
-          <span class="hint">Optional tag to organise agents (e.g. Production, Dev, Personal)</span>
+          <div class="field-hint">Organise agents by team, purpose, or environment</div>
         </div>
       </div>
     </div>
 
-    <!-- Step 2: Connection type -->
-    <div class="wpage" id="wp2">
-      <p class="wdesc">How will Orchestra connect to this agent?</p>
-      <div class="conn-options">
-
-        <label class="conn-option">
-          <input type="radio" name="conn-type" value="http_only" checked>
-          <div class="conn-card">
-            <span class="conn-icon">👁️</span>
-            <div>
-              <div class="conn-name">Watch Only</div>
-              <div class="conn-sub">Just see if it's online. No restart or stop controls.</div>
-            </div>
+    <!-- Step 2 -->
+    <div class="wizard-page" id="wp-2">
+      <p class="wiz-desc">How will Orchestra connect to this agent?</p>
+      <div class="conn-grid">
+        <label class="conn-card">
+          <input type="radio" name="conn" value="http_only" checked>
+          <div class="cc-body">
+            <div class="cc-icon">👁️</div>
+            <div class="cc-name">Watch Only</div>
+            <div class="cc-desc">See if it's online. No controls or log access.</div>
           </div>
         </label>
-
-        <label class="conn-option">
-          <input type="radio" name="conn-type" value="direct_ssh">
-          <div class="conn-card">
-            <span class="conn-icon">🖥️</span>
-            <div>
-              <div class="conn-name">Linux Server or VPS</div>
-              <div class="conn-sub">The agent runs directly on a Linux machine you can SSH into.</div>
-            </div>
+        <label class="conn-card">
+          <input type="radio" name="conn" value="direct_ssh">
+          <div class="cc-body">
+            <div class="cc-icon">🖥️</div>
+            <div class="cc-name">Linux / VPS</div>
+            <div class="cc-desc">SSH directly into the machine running the agent.</div>
           </div>
         </label>
-
-        <label class="conn-option">
-          <input type="radio" name="conn-type" value="proxmox_lxc">
-          <div class="conn-card">
-            <span class="conn-icon">📦</span>
-            <div>
-              <div class="conn-name">Proxmox Container</div>
-              <div class="conn-sub">The agent lives in a Proxmox LXC container. You SSH into the Proxmox host.</div>
-            </div>
+        <label class="conn-card">
+          <input type="radio" name="conn" value="proxmox_lxc">
+          <div class="cc-body">
+            <div class="cc-icon">📦</div>
+            <div class="cc-name">Proxmox Container</div>
+            <div class="cc-desc">SSH into the Proxmox host and exec into the LXC container.</div>
           </div>
         </label>
-
-        <label class="conn-option">
-          <input type="radio" name="conn-type" value="docker">
-          <div class="conn-card">
-            <span class="conn-icon">🐳</span>
-            <div>
-              <div class="conn-name">Docker Container</div>
-              <div class="conn-sub">The agent runs inside a Docker container. You SSH into the Docker host.</div>
-            </div>
+        <label class="conn-card">
+          <input type="radio" name="conn" value="docker">
+          <div class="cc-body">
+            <div class="cc-icon">🐳</div>
+            <div class="cc-name">Docker</div>
+            <div class="cc-desc">SSH into the Docker host and exec into the container.</div>
           </div>
         </label>
-
       </div>
     </div>
 
-    <!-- Step 3: Connection details (dynamic) -->
-    <div class="wpage" id="wp3">
-      <p class="wdesc" id="w3-desc">Enter the connection details below.</p>
-      <div class="fg" id="w3-fields">
-        <!-- Populated by JS based on connection type -->
+    <!-- Step 3 -->
+    <div class="wizard-page" id="wp-3">
+      <div class="form-grid" id="wp3-fields">
+        <!-- populated by JS -->
       </div>
     </div>
 
     <div class="modal-foot">
-      <button class="btn-ghost" id="w-back" onclick="wizardBack()" style="display:none">← Back</button>
+      <button class="btn-ghost" id="w-back" onclick="wBack()" style="display:none">← Back</button>
       <div style="flex:1"></div>
-      <button class="btn-ghost" onclick="closeAddWizard()">Cancel</button>
-      <button class="btn-primary" id="w-next" onclick="wizardNext()">Next →</button>
-    </div>
-  </div>
-</div>
-
-
-<!-- ══════════════════════════════════════════════════════════════════════════
-     AGENT DETAIL MODAL
-══════════════════════════════════════════════════════════════════════════════ -->
-<div class="overlay" id="detail-overlay" onclick="closeDetail(event)">
-  <div class="modal modal-wide" onclick="event.stopPropagation()">
-
-    <div class="modal-head">
-      <div class="detail-hd">
-        <span id="d-emoji" style="font-size:1.8rem">🤖</span>
-        <div>
-          <div id="d-name" style="font-size:1.15rem; font-weight:800"></div>
-          <div id="d-chip" class="status-chip"></div>
-        </div>
-      </div>
-      <button class="modal-x" onclick="closeDetail()">✕</button>
-    </div>
-
-    <div class="detail-tabs">
-      <button class="dtab active" onclick="showDTab('overview',this)">Overview</button>
-      <button class="dtab" onclick="showDTab('logs',this)">Live Logs</button>
-      <button class="dtab" onclick="showDTab('config',this)">Config</button>
-      <button class="dtab" onclick="showDTab('settings',this)">Settings</button>
-    </div>
-
-    <!-- Overview ─────────────────────────────────────────────────────────── -->
-    <div class="dpanel active" id="dpanel-overview">
-
-      <div class="stat-row" id="d-stats"></div>
-
-      <!-- Sparkline (full 48h) -->
-      <div class="dsection">
-        <div class="dsec-label">48-hour uptime history</div>
-        <div class="spark-row" id="d-spark-full"></div>
-        <div style="font-size:.72rem; color:var(--muted); margin-top:4px">Each dot = one status check · 🟢 online · 🔴 offline</div>
-      </div>
-
-      <div class="dsection">
-        <div class="dsec-label">What's happening</div>
-        <div class="activity-box" id="d-activity">Loading…</div>
-      </div>
-
-      <div class="dsection">
-        <div class="dsec-label">Controls</div>
-        <div class="ctrl-row" id="d-ctrls"></div>
-        <div class="action-log" id="d-action-log" style="display:none">
-          <div id="d-action-out"></div>
-        </div>
-      </div>
-
-      <div class="dsection">
-        <div class="dsec-label">Quick links</div>
-        <div id="d-links"></div>
-      </div>
-
-    </div>
-
-    <!-- Logs ─────────────────────────────────────────────────────────────── -->
-    <div class="dpanel" id="dpanel-logs">
-      <div class="logbar">
-        <span style="color:var(--muted); font-size:.82rem">Last 80 lines from the agent's log</span>
-        <button class="btn-sm" onclick="loadLogs()">🔄 Refresh</button>
-      </div>
-      <div class="log-box" id="d-log-box">
-        <div style="color:var(--muted); font-style:italic; padding:.5rem">Click Refresh to load</div>
-      </div>
-    </div>
-
-    <!-- Config ───────────────────────────────────────────────────────────── -->
-    <div class="dpanel" id="dpanel-config">
-      <div class="logbar">
-        <span style="color:var(--muted); font-size:.82rem">Read-only view of openclaw.json on this agent</span>
-        <button class="btn-sm" onclick="loadConfig()">🔄 Load Config</button>
-      </div>
-      <pre class="config-box" id="d-config-box">Click "Load Config" to read the configuration file from this agent.</pre>
-    </div>
-
-    <!-- Settings ─────────────────────────────────────────────────────────── -->
-    <div class="dpanel" id="dpanel-settings">
-      <div class="fg" id="d-settings-form"></div>
-      <div style="display:flex; gap:.75rem; margin-top:1.25rem; flex-wrap:wrap">
-        <button class="btn-primary" onclick="saveSettings()">Save Changes</button>
-        <button class="btn-ghost" onclick="refreshAgent()" style="gap:.3rem">
-          🔄 Refresh Status
-        </button>
-        <button class="btn-ghost danger" onclick="removeAgent()">Remove Agent</button>
-      </div>
+      <button class="btn-ghost" onclick="closeWizard()">Cancel</button>
+      <button class="btn-primary" id="w-next" onclick="wNext()">Next →</button>
     </div>
 
   </div>
 </div>
 
 
-<!-- ══════════════════════════════════════════════════════════════════════════
-     BULK ACTION LOG
-══════════════════════════════════════════════════════════════════════════════ -->
-<div class="overlay" id="bulk-overlay" onclick="closeBulkOverlay(event)">
+<!-- ══════════════════════════════════════════════════════════
+     BULK JOB LOG MODAL
+══════════════════════════════════════════════════════════════ -->
+<div class="modal-overlay" id="bulk-overlay" onclick="closeBulkModal(event)">
   <div class="modal" onclick="event.stopPropagation()">
     <div class="modal-head">
-      <h2 id="bulk-title">Bulk Action</h2>
-      <button class="modal-x" onclick="closeBulkOverlay()">✕</button>
+      <h2 class="modal-title" id="bulk-modal-title">Bulk Action</h2>
+      <button class="modal-close" onclick="closeBulkModal()">✕</button>
     </div>
-    <div style="padding:1.25rem 1.5rem; flex:1; overflow-y:auto">
-      <div class="action-log" style="display:block; max-height:320px">
-        <div id="bulk-log-out"></div>
-      </div>
+    <div style="padding:1.25rem 1.5rem;flex:1;overflow-y:auto">
+      <div class="job-log" style="display:block;max-height:360px"><div id="bulk-log-out"></div></div>
     </div>
     <div class="modal-foot">
       <div style="flex:1"></div>
-      <button class="btn-ghost" onclick="closeBulkOverlay()">Close</button>
+      <button class="btn-ghost" onclick="closeBulkModal()">Close</button>
     </div>
   </div>
 </div>

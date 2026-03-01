@@ -1,17 +1,19 @@
 """
-OpenClaw Orchestra
-Universal control plane for OpenClaw agents.
-Works with any OpenClaw instance — no Proxmox required.
+OpenClaw Orchestra v2 — Universal Command Centre
+FastAPI backend: agent registry, status polling, cost tracking,
+session proxy, reasoning extraction, live WebSocket feeds.
 """
 
 import asyncio
 import json
 import logging
 import queue
+import re
 import shlex
 import sqlite3
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -31,45 +33,37 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("orchestra")
 
-app = FastAPI(title="OpenClaw Orchestra", description="Universal OpenClaw fleet management", version="1.0.0")
+app = FastAPI(title="OpenClaw Orchestra", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-
 class ConnectionType(str, Enum):
-    http_only   = "http_only"    # Status only — no SSH controls
-    direct_ssh  = "direct_ssh"   # SSH directly to the agent's host
-    proxmox_lxc = "proxmox_lxc" # SSH to Proxmox host, then pct exec
-    docker      = "docker"       # SSH to Docker host, then docker exec
+    http_only   = "http_only"
+    direct_ssh  = "direct_ssh"
+    proxmox_lxc = "proxmox_lxc"
+    docker      = "docker"
 
 # ---------------------------------------------------------------------------
-# Data models
+# Models
 # ---------------------------------------------------------------------------
-
 class AgentRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    # Identity
     name: str
     emoji: str = "🤖"
     description: str = ""
     group: str = "default"
-    # Gateway
     host: str
     port: int = 18789
     gateway_token: Optional[str] = None
-    # Connection
     connection_type: ConnectionType = ConnectionType.http_only
-    ssh_host: Optional[str] = None       # defaults to host
+    ssh_host: Optional[str] = None
     ssh_port: int = 22
     ssh_username: str = "root"
     ssh_password: Optional[str] = None
-    # Proxmox-specific
     proxmox_vmid: Optional[int] = None
-    # Docker-specific
     docker_container: Optional[str] = None
-    # Meta
     added_at: float = Field(default_factory=time.time)
     notes: str = ""
 
@@ -85,26 +79,52 @@ class AgentStatusData(BaseModel):
     response_ms: Optional[float] = None
     recent_logs: List[str] = []
     openclaw_version: Optional[str] = None
+    model: Optional[str] = None
     error: Optional[str] = None
 
 
 class ControlRequest(BaseModel):
-    action: str    # start | stop | restart | repair | update
+    action: str
     ssh_password: Optional[str] = None
 
 
 class BulkRequest(BaseModel):
-    action: str    # restart_all | stop_all | start_all
-    group: Optional[str] = None    # limit to group (None = all)
-
+    action: str
+    group: Optional[str] = None
 
 # ---------------------------------------------------------------------------
-# Persistent storage
+# Model pricing  (USD per 1M tokens)
 # ---------------------------------------------------------------------------
-DATA_DIR  = Path(__file__).parent / "data"
+MODEL_PRICING: Dict[str, Dict[str, float]] = {
+    "claude-opus-4":      {"in": 15.0, "out": 75.0},
+    "claude-sonnet-4":    {"in": 3.0,  "out": 15.0},
+    "claude-haiku-3-5":   {"in": 0.80, "out": 4.0},
+    "claude-haiku":       {"in": 0.25, "out": 1.25},
+    "gpt-4o":             {"in": 5.0,  "out": 15.0},
+    "gpt-4.1":            {"in": 2.0,  "out": 8.0},
+    "gpt-4.1-mini":       {"in": 0.40, "out": 1.60},
+    "o4-mini":            {"in": 1.10, "out": 4.40},
+    "gemini-2.5-pro":     {"in": 1.25, "out": 5.0},
+    "gemini-2.5-flash":   {"in": 0.075,"out": 0.30},
+    "deepseek":           {"in": 0.14, "out": 0.28},
+}
+
+def _model_cost(model: str, in_tok: int, out_tok: int) -> float:
+    if not model:
+        return 0.0
+    ml = model.lower()
+    for key, p in MODEL_PRICING.items():
+        if key in ml:
+            return (in_tok * p["in"] + out_tok * p["out"]) / 1_000_000
+    return 0.0
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+DATA_DIR    = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 AGENTS_FILE = DATA_DIR / "agents.json"
-DB_FILE     = DATA_DIR / "history.db"
+DB_FILE     = DATA_DIR / "orchestra.db"
 
 
 def _load_agents() -> Dict[str, AgentRecord]:
@@ -114,57 +134,75 @@ def _load_agents() -> Dict[str, AgentRecord]:
         raw = json.loads(AGENTS_FILE.read_text())
         return {k: AgentRecord(**v) for k, v in raw.items()}
     except Exception as exc:
-        log.error("Failed to load agents: %s", exc)
+        log.error("load agents: %s", exc)
         return {}
 
 
 def _save_agents(agents: Dict[str, AgentRecord]):
-    AGENTS_FILE.write_text(json.dumps({k: v.model_dump() for k, v in agents.items()}, indent=2))
-
+    AGENTS_FILE.write_text(
+        json.dumps({k: v.model_dump() for k, v in agents.items()}, indent=2)
+    )
 
 # ---------------------------------------------------------------------------
-# History (SQLite — built into Python, no extra dependency)
+# Database — history, costs, events
 # ---------------------------------------------------------------------------
-
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_FILE))
+    conn = sqlite3.connect(str(DB_FILE), timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def _init_db():
-    with _db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id   TEXT    NOT NULL,
-                checked_at REAL    NOT NULL,
-                online     INTEGER NOT NULL,
+    with _db() as c:
+        c.executescript("""
+            CREATE TABLE IF NOT EXISTS status_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id    TEXT    NOT NULL,
+                checked_at  REAL    NOT NULL,
+                online      INTEGER NOT NULL,
                 response_ms REAL
-            )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_agent ON history(agent_id, checked_at)")
-    log.info("History DB ready")
+            );
+            CREATE INDEX IF NOT EXISTS idx_sh ON status_history(agent_id, checked_at);
+
+            CREATE TABLE IF NOT EXISTS cost_events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id    TEXT NOT NULL,
+                recorded_at REAL NOT NULL,
+                day         TEXT NOT NULL,
+                model       TEXT,
+                input_tok   INTEGER DEFAULT 0,
+                output_tok  INTEGER DEFAULT 0,
+                cost_usd    REAL    DEFAULT 0.0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ce ON cost_events(agent_id, day);
+
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id    TEXT NOT NULL,
+                ts          REAL NOT NULL,
+                event_type  TEXT,
+                message     TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_al ON activity_log(ts);
+        """)
+    log.info("DB ready: %s", DB_FILE)
 
 
-def _store_history(agent_id: str, online: bool, response_ms: Optional[float]):
-    with _db() as conn:
-        conn.execute(
-            "INSERT INTO history (agent_id, checked_at, online, response_ms) VALUES (?,?,?,?)",
-            (agent_id, time.time(), int(online), response_ms),
+def _store_history(agent_id, online, ms):
+    with _db() as c:
+        c.execute(
+            "INSERT INTO status_history (agent_id, checked_at, online, response_ms) VALUES(?,?,?,?)",
+            (agent_id, time.time(), int(online), ms),
         )
-        # Keep last 48 per agent
-        conn.execute("""
-            DELETE FROM history WHERE id IN (
-                SELECT id FROM history WHERE agent_id=?
-                ORDER BY checked_at DESC LIMIT -1 OFFSET 48)""",
-            (agent_id,),
-        )
+        c.execute("""DELETE FROM status_history WHERE id IN (
+            SELECT id FROM status_history WHERE agent_id=?
+            ORDER BY checked_at DESC LIMIT -1 OFFSET 60)""", (agent_id,))
 
 
-def get_history(agent_id: str, n: int = 24) -> List[dict]:
-    with _db() as conn:
-        rows = conn.execute(
-            "SELECT checked_at, online, response_ms FROM history "
+def get_history(agent_id, n=48):
+    with _db() as c:
+        rows = c.execute(
+            "SELECT checked_at, online, response_ms FROM status_history "
             "WHERE agent_id=? ORDER BY checked_at DESC LIMIT ?",
             (agent_id, n),
         ).fetchall()
@@ -172,15 +210,64 @@ def get_history(agent_id: str, n: int = 24) -> List[dict]:
             for r in reversed(rows)]
 
 
+def _store_cost(agent_id, model, in_tok, out_tok):
+    if in_tok == 0 and out_tok == 0:
+        return
+    cost = _model_cost(model, in_tok, out_tok)
+    day  = datetime.now().strftime("%Y-%m-%d")
+    with _db() as c:
+        c.execute(
+            "INSERT INTO cost_events (agent_id, recorded_at, day, model, input_tok, output_tok, cost_usd)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (agent_id, time.time(), day, model, in_tok, out_tok, cost),
+        )
+
+
+def _get_costs(agent_id, days=14):
+    with _db() as c:
+        rows = c.execute("""
+            SELECT day, model,
+                   SUM(input_tok) as in_tok, SUM(output_tok) as out_tok,
+                   SUM(cost_usd)  as cost
+            FROM cost_events WHERE agent_id=?
+            GROUP BY day, model ORDER BY day DESC LIMIT ?""",
+            (agent_id, days * 10)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _today_cost(agent_id):
+    day = datetime.now().strftime("%Y-%m-%d")
+    with _db() as c:
+        row = c.execute(
+            "SELECT SUM(cost_usd) as total FROM cost_events WHERE agent_id=? AND day=?",
+            (agent_id, day)).fetchone()
+    return round(row["total"] or 0.0, 6)
+
+
+def _log_event(agent_id, event_type, message):
+    with _db() as c:
+        c.execute(
+            "INSERT INTO activity_log (agent_id, ts, event_type, message) VALUES(?,?,?,?)",
+            (agent_id, time.time(), event_type, message[:500]),
+        )
+        c.execute("DELETE FROM activity_log WHERE id IN "
+                  "(SELECT id FROM activity_log ORDER BY ts DESC LIMIT -1 OFFSET 2000)")
+
+
+def _recent_events(n=50):
+    with _db() as c:
+        rows = c.execute(
+            "SELECT agent_id, ts, event_type, message FROM activity_log "
+            "ORDER BY ts DESC LIMIT ?", (n,)).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
 _init_db()
 
 # ---------------------------------------------------------------------------
 # HTTP ping
 # ---------------------------------------------------------------------------
-
-def _http_ping(host: str, port: int, token: Optional[str] = None) -> tuple:
-    """Returns (online: bool, response_ms: float | None)."""
-    import urllib.request
+def _http_ping(host, port, token=None):
     t0 = time.time()
     try:
         req = urllib.request.Request(f"http://{host}:{port}/", method="GET")
@@ -190,7 +277,6 @@ def _http_ping(host: str, port: int, token: Optional[str] = None) -> tuple:
             with urllib.request.urlopen(req, timeout=5):
                 pass
         except Exception as exc:
-            # Any HTTP error (401/403/404) means gateway is up
             if hasattr(exc, "code") and exc.code < 500:
                 return True, round((time.time() - t0) * 1000, 1)
             raise
@@ -199,130 +285,142 @@ def _http_ping(host: str, port: int, token: Optional[str] = None) -> tuple:
         return False, None
 
 # ---------------------------------------------------------------------------
+# Gateway API proxy helper
+# ---------------------------------------------------------------------------
+def _gateway_fetch(agent: AgentRecord, path: str) -> Optional[dict]:
+    try:
+        url = f"http://{agent.host}:{agent.port}/{path.lstrip('/')}"
+        req = urllib.request.Request(url)
+        if agent.gateway_token:
+            req.add_header("Authorization", f"Bearer {agent.gateway_token}")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+            return json.loads(raw)
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
 # SSH execution
 # ---------------------------------------------------------------------------
-
 def _ssh_run(agent: AgentRecord, command: str,
              password: Optional[str] = None, timeout: int = 30) -> str:
-    """
-    Run a command on the agent's host via SSH.
-    Handles direct SSH, Proxmox pct exec, and Docker exec transparently.
-    """
     import paramiko
     pw = password or agent.ssh_password
     if not pw:
-        raise RuntimeError("SSH password not set for this agent")
-
+        raise RuntimeError("No SSH password")
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh_host = agent.ssh_host or agent.host
-
     try:
         ssh.connect(ssh_host, port=agent.ssh_port, username=agent.ssh_username,
                     password=pw, timeout=15, banner_timeout=30)
-
-        # Wrap command for container connection types
         if agent.connection_type == ConnectionType.proxmox_lxc and agent.proxmox_vmid:
             command = f"pct exec {agent.proxmox_vmid} -- bash -c {shlex.quote(command)}"
         elif agent.connection_type == ConnectionType.docker and agent.docker_container:
             command = f"docker exec {shlex.quote(agent.docker_container)} bash -c {shlex.quote(command)}"
-
         _, stdout, _ = ssh.exec_command(command, timeout=timeout)
-        out = stdout.read().decode(errors="replace")
-        return out
+        return stdout.read().decode(errors="replace")
     finally:
-        try:
-            ssh.close()
-        except Exception:
-            pass
+        try: ssh.close()
+        except: pass
+
+# ---------------------------------------------------------------------------
+# Token usage parsing from logs
+# ---------------------------------------------------------------------------
+_TOK_PATTERNS = [
+    # "prompt_tokens=1234, completion_tokens=567"
+    re.compile(r"prompt_tokens[=:](\d+).*?completion_tokens[=:](\d+)", re.I),
+    # "input=1234 output=567"
+    re.compile(r"input[_\s]*tok[a-z]*[=:]\s*(\d+).*?output[_\s]*tok[a-z]*[=:]\s*(\d+)", re.I),
+    # "tokens: 1234 in, 567 out"
+    re.compile(r"(\d+)\s*in(?:put)?\s*(?:tok[a-z]*).*?(\d+)\s*out(?:put)?\s*(?:tok[a-z]*)", re.I),
+    # "used N tokens (X input, Y output)"
+    re.compile(r"(\d+)\s+input.*?(\d+)\s+output", re.I),
+    # OpenClaw format: "usage: input_tokens=X output_tokens=Y"
+    re.compile(r"input_tokens[=:](\d+).*?output_tokens[=:](\d+)", re.I),
+]
+
+_MODEL_PATTERN = re.compile(
+    r"(?:model|using)[=:\s]+['\"]?(claude[-\w./]+|gpt[-\w.]+|o\d[-\w]+|gemini[-\w./]+)", re.I
+)
 
 
-def _ssh_stream(agent: AgentRecord, command: str,
-                log_fn, password: Optional[str] = None, timeout: int = 400):
-    """Run a command via SSH and stream output line by line to log_fn."""
-    import paramiko
-    pw = password or agent.ssh_password
+def _parse_token_usage(logs: List[str]) -> List[Dict]:
+    """Return list of {model, in_tok, out_tok} from log lines."""
+    results = []
+    current_model = None
+    for line in logs:
+        m = _MODEL_PATTERN.search(line)
+        if m:
+            current_model = m.group(1).lower()
+        for pat in _TOK_PATTERNS:
+            tm = pat.search(line)
+            if tm:
+                try:
+                    in_t  = int(tm.group(1))
+                    out_t = int(tm.group(2))
+                    if in_t > 0 or out_t > 0:
+                        results.append({"model": current_model or "unknown",
+                                        "in_tok": in_t, "out_tok": out_t})
+                except Exception:
+                    pass
+                break
+    return results
 
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh_host = agent.ssh_host or agent.host
 
-    try:
-        ssh.connect(ssh_host, port=agent.ssh_port, username=agent.ssh_username,
-                    password=pw, timeout=15, banner_timeout=30)
+def _extract_reasoning(logs: List[str]) -> List[Dict]:
+    """Extract <thinking>…</thinking> blocks from log lines."""
+    blocks = []
+    current: List[str] = []
+    in_block = False
+    ts_line  = None
 
-        if agent.connection_type == ConnectionType.proxmox_lxc and agent.proxmox_vmid:
-            command = f"pct exec {agent.proxmox_vmid} -- bash -c {shlex.quote(command)}"
-        elif agent.connection_type == ConnectionType.docker and agent.docker_container:
-            command = f"docker exec {shlex.quote(agent.docker_container)} bash -c {shlex.quote(command)}"
+    for line in logs:
+        if "<thinking>" in line.lower() or "```thinking" in line.lower():
+            in_block = True
+            current  = []
+            ts_line  = line[:30]
+            continue
+        if in_block:
+            if "</thinking>" in line.lower() or "```" in line:
+                in_block = False
+                if current:
+                    blocks.append({"ts": ts_line, "content": "\n".join(current)})
+                current = []
+            else:
+                current.append(line)
+    return blocks[-10:]  # last 10 blocks
 
-        _, stdout, _ = ssh.exec_command(command, timeout=timeout, get_pty=True)
-        for line in iter(stdout.readline, ""):
-            if line.strip():
-                log_fn(line.rstrip())
-        return stdout.channel.recv_exit_status()
-    finally:
-        try:
-            ssh.close()
-        except Exception:
-            pass
+
+def _parse_sessions_from_logs(logs: List[str]) -> List[Dict]:
+    """Best-effort session extraction from log lines."""
+    sessions: Dict[str, Dict] = {}
+    sess_pat  = re.compile(r"session[_\s]?(?:key)?[=:\s]+([a-zA-Z0-9_-]{6,})", re.I)
+    chan_pat  = re.compile(r"channel[=:\s]+([a-zA-Z]+)", re.I)
+    for line in logs:
+        sm = sess_pat.search(line)
+        if sm:
+            key = sm.group(1)
+            if key not in sessions:
+                sessions[key] = {"key": key, "channel": "unknown", "messages": 0, "last_seen": ""}
+            sessions[key]["messages"] += 1
+            sessions[key]["last_seen"] = line[:40]
+            cm = chan_pat.search(line)
+            if cm:
+                sessions[key]["channel"] = cm.group(1)
+    return list(sessions.values())[-20:]
 
 # ---------------------------------------------------------------------------
 # Status check
 # ---------------------------------------------------------------------------
-
-def _check_status(agent: AgentRecord) -> AgentStatusData:
-    s = AgentStatusData(id=agent.id, last_checked=time.time())
-
-    # 1. HTTP ping
-    online, ms = _http_ping(agent.host, agent.port, agent.gateway_token)
-    s.online = online
-    s.response_ms = ms
-
-    if not online:
-        s.headline = "Offline — not responding"
-        s.activity  = "Cannot reach this agent"
-        _store_history(agent.id, False, None)
-        return s
-
-    _store_history(agent.id, True, ms)
-
-    # 2. SSH for richer info (optional)
-    has_ssh = agent.connection_type != ConnectionType.http_only and agent.ssh_password
-    if has_ssh:
-        try:
-            svc = _ssh_run(agent, "systemctl is-active openclaw 2>/dev/null").strip()
-            s.service_ok = svc == "active"
-
-            ts_raw = _ssh_run(agent,
-                "systemctl show openclaw --property=ActiveEnterTimestamp --value 2>/dev/null").strip()
-            s.uptime_human = _human_uptime(ts_raw)
-
-            log_raw = _ssh_run(agent,
-                "journalctl -u openclaw -n 40 --no-pager --output=cat 2>/dev/null", timeout=15)
-            s.recent_logs = [l for l in log_raw.splitlines() if l.strip()][-40:]
-            s.activity    = _parse_activity(s.recent_logs)
-
-            ver = _ssh_run(agent, "openclaw --version 2>/dev/null").strip()
-            if ver:
-                s.openclaw_version = ver
-
-        except Exception as exc:
-            log.debug("SSH check failed for %s: %s", agent.id, exc)
-
-    up = f" · Up {s.uptime_human}" if s.uptime_human else ""
-    s.headline = f"Online{up}" if s.service_ok or not has_ssh else "Online — service starting"
-    return s
-
-
 def _human_uptime(ts_raw: str) -> Optional[str]:
     if not ts_raw or ts_raw.strip() in ("", "n/a"):
         return None
     try:
-        parts = ts_raw.strip().split()
+        parts  = ts_raw.strip().split()
         dt_str = " ".join(parts[-3:])
-        dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc)
-        secs = int((datetime.now(timezone.utc) - dt).total_seconds())
+        dt     = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S %Z").replace(tzinfo=timezone.utc)
+        secs   = int((datetime.now(timezone.utc) - dt).total_seconds())
         if secs < 60:    return f"{secs}s"
         if secs < 3600:  return f"{secs // 60}m"
         if secs < 86400: return f"{secs // 3600}h {(secs % 3600) // 60}m"
@@ -333,16 +431,18 @@ def _human_uptime(ts_raw: str) -> Optional[str]:
 
 def _parse_activity(logs: List[str]) -> str:
     checks = [
-        ("sending",   "Sent a reply"),
-        ("response",  "Sent a reply"),
-        ("tool",      "Used a tool"),
-        ("heartbeat", "Running scheduled checks"),
-        ("cron",      "Running a scheduled task"),
-        ("connected", "Connected and ready"),
-        ("session",   "Active conversation"),
-        ("channel",   "Handling a channel event"),
-        ("error",     "Encountered an issue — check logs"),
-        ("warn",      "Something needs attention"),
+        ("sending",    "Sent a reply"),
+        ("response",   "Sent a reply"),
+        ("tool call",  "Used a tool"),
+        ("heartbeat",  "Running scheduled checks"),
+        ("cron",       "Running a scheduled task"),
+        ("connected",  "Connected and ready"),
+        ("session",    "Active conversation"),
+        ("channel",    "Handling a channel event"),
+        ("sub-agent",  "Spawned a sub-agent"),
+        ("subagent",   "Spawned a sub-agent"),
+        ("error",      "Encountered an issue"),
+        ("warn",       "Something needs attention"),
     ]
     for line in reversed(logs):
         ll = line.lower()
@@ -351,18 +451,72 @@ def _parse_activity(logs: List[str]) -> str:
                 return label
     return "Idle — waiting for messages"
 
-# ---------------------------------------------------------------------------
-# Background status poller
-# ---------------------------------------------------------------------------
 
+def _check_status(agent: AgentRecord) -> AgentStatusData:
+    s = AgentStatusData(id=agent.id, last_checked=time.time())
+    online, ms = _http_ping(agent.host, agent.port, agent.gateway_token)
+    s.online     = online
+    s.response_ms = ms
+    _store_history(agent.id, online, ms)
+
+    if not online:
+        s.headline  = "Offline — not responding"
+        s.activity  = "Cannot reach this agent"
+        _log_event(agent.id, "offline", "Agent went offline")
+        return s
+
+    has_ssh = agent.connection_type != ConnectionType.http_only and agent.ssh_password
+    if has_ssh:
+        try:
+            svc = _ssh_run(agent,
+                "systemctl is-active openclaw 2>/dev/null && "
+                "systemctl show openclaw --property=ActiveEnterTimestamp --value 2>/dev/null").strip()
+            lines = svc.splitlines()
+            s.service_ok   = lines[0].strip() == "active" if lines else False
+            s.uptime_human = _human_uptime(lines[1]) if len(lines) > 1 else None
+
+            raw_logs = _ssh_run(agent,
+                "journalctl -u openclaw -n 120 --no-pager --output=cat 2>/dev/null", timeout=20)
+            s.recent_logs = [l for l in raw_logs.splitlines() if l.strip()][-120:]
+            s.activity    = _parse_activity(s.recent_logs)
+
+            # Version + model
+            ver = _ssh_run(agent, "openclaw --version 2>/dev/null").strip()
+            s.openclaw_version = ver or None
+
+            model_raw = _ssh_run(agent,
+                "grep -o '\"model\"\\s*:\\s*\"[^\"]*\"' /home/openclaw/.openclaw/openclaw.json 2>/dev/null"
+                " | head -1 | sed 's/.*: *\"//;s/\"//'").strip()
+            s.model = model_raw or None
+
+            # Token usage → cost
+            usages = _parse_token_usage(s.recent_logs)
+            for u in usages:
+                _store_cost(agent.id, u["model"], u["in_tok"], u["out_tok"])
+
+        except Exception as exc:
+            log.debug("SSH check %s: %s", agent.id, exc)
+
+    up = f" · Up {s.uptime_human}" if s.uptime_human else ""
+    s.headline = f"Online{up}"
+    _log_event(agent.id, "status", s.activity)
+    return s
+
+# ---------------------------------------------------------------------------
+# Background poller
+# ---------------------------------------------------------------------------
 _agent_statuses: Dict[str, AgentStatusData] = {}
-_ws_listeners: List[queue.Queue] = []
+_ws_listeners:   List[queue.Queue] = []
 _POLL_INTERVAL = 30
 
 
 def _broadcast(msg: dict):
+    dead = []
     for q in _ws_listeners:
-        q.put(msg)
+        try: q.put_nowait(msg)
+        except queue.Full: dead.append(q)
+    for q in dead:
+        if q in _ws_listeners: _ws_listeners.remove(q)
 
 
 def _refresh_one(agent_id: str):
@@ -371,67 +525,65 @@ def _refresh_one(agent_id: str):
         return
     s = _check_status(agents[agent_id])
     _agent_statuses[agent_id] = s
-    _broadcast({"type": "update", "id": agent_id, "status": s.model_dump()})
+    _broadcast({"type": "agent_update", "id": agent_id, "status": s.model_dump()})
 
 
 def _poll_loop():
     while True:
-        try:
-            for aid in list(_load_agents().keys()):
+        for aid in list(_load_agents().keys()):
+            try:
                 _refresh_one(aid)
-        except Exception as exc:
-            log.error("Poller: %s", exc)
+            except Exception as exc:
+                log.error("poll %s: %s", aid, exc)
+        _broadcast({"type": "events", "events": _recent_events(30)})
         time.sleep(_POLL_INTERVAL)
 
 
 threading.Thread(target=_poll_loop, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# Job store (for control action log streaming)
+# Job store
 # ---------------------------------------------------------------------------
-
-_jobs: Dict[str, dict] = {}
+_jobs:       Dict[str, dict]  = {}
 _job_queues: Dict[str, queue.Queue] = {}
 
 
 def _job_create() -> str:
     jid = str(uuid.uuid4())
-    _jobs[jid] = {"status": "pending", "error": None}
-    _job_queues[jid] = queue.Queue()
+    _jobs[jid]       = {"status": "pending", "error": None}
+    _job_queues[jid] = queue.Queue(maxsize=500)
     return jid
 
 
-def _job_update(jid: str, status: str, error: Optional[str] = None):
+def _job_update(jid, status, error=None):
     if jid in _jobs:
-        _jobs[jid]["status"] = status
-        _jobs[jid]["error"]  = error
+        _jobs[jid].update({"status": status, "error": error})
 
 
-def _job_log(jid: str, msg: str, level: str = "info"):
+def _job_log(jid, msg, level="info"):
     if jid in _job_queues:
         _job_queues[jid].put({
             "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "level": level,
-            "message": msg,
+            "level": level, "message": msg,
         })
 
 # ---------------------------------------------------------------------------
-# CRUD routes
+# CRUD
 # ---------------------------------------------------------------------------
-
 @app.get("/api/agents")
 async def list_agents():
     agents = _load_agents()
     result = []
     for aid, agent in agents.items():
-        s = _agent_statuses.get(aid)
+        s    = _agent_statuses.get(aid)
         hist = get_history(aid, 24)
         result.append({
             **agent.model_dump(exclude={"ssh_password", "gateway_token"}),
-            "has_ssh_password": bool(agent.ssh_password),
+            "has_ssh_password":  bool(agent.ssh_password),
             "has_gateway_token": bool(agent.gateway_token),
-            "status": s.model_dump() if s else None,
+            "status":    s.model_dump() if s else None,
             "sparkline": [{"online": h["online"]} for h in hist],
+            "cost_today": _today_cost(aid),
         })
     return result
 
@@ -454,13 +606,13 @@ async def get_agent(agent_id: str):
         raise HTTPException(404, "Agent not found")
     agent = agents[agent_id]
     s     = _agent_statuses.get(agent_id)
-    hist  = get_history(agent_id, 48)
     return {
         **agent.model_dump(exclude={"ssh_password", "gateway_token"}),
-        "has_ssh_password": bool(agent.ssh_password),
+        "has_ssh_password":  bool(agent.ssh_password),
         "has_gateway_token": bool(agent.gateway_token),
-        "status": s.model_dump() if s else None,
-        "sparkline": [{"online": h["online"]} for h in hist],
+        "status":     s.model_dump() if s else None,
+        "sparkline":  get_history(agent_id, 48),
+        "cost_today": _today_cost(agent_id),
     }
 
 
@@ -468,9 +620,8 @@ async def get_agent(agent_id: str):
 async def update_agent(agent_id: str, agent: AgentRecord):
     agents = _load_agents()
     if agent_id not in agents:
-        raise HTTPException(404, "Agent not found")
+        raise HTTPException(404)
     agent.id = agent_id
-    # Preserve stored secrets if not re-sent
     if not agent.ssh_password:
         agent.ssh_password = agents[agent_id].ssh_password
     if not agent.gateway_token:
@@ -484,7 +635,7 @@ async def update_agent(agent_id: str, agent: AgentRecord):
 async def delete_agent(agent_id: str):
     agents = _load_agents()
     if agent_id not in agents:
-        raise HTTPException(404, "Agent not found")
+        raise HTTPException(404)
     del agents[agent_id]
     _save_agents(agents)
     _agent_statuses.pop(agent_id, None)
@@ -495,26 +646,29 @@ async def delete_agent(agent_id: str):
 async def refresh_agent(agent_id: str, background_tasks: BackgroundTasks):
     agents = _load_agents()
     if agent_id not in agents:
-        raise HTTPException(404, "Agent not found")
+        raise HTTPException(404)
     background_tasks.add_task(_refresh_one, agent_id)
     return {"ok": True}
 
-
+# ---------------------------------------------------------------------------
+# Rich data endpoints
+# ---------------------------------------------------------------------------
 @app.get("/api/agents/{agent_id}/history")
 async def agent_history(agent_id: str, n: int = 48):
     return get_history(agent_id, n)
 
 
 @app.get("/api/agents/{agent_id}/logs")
-async def agent_logs(agent_id: str, lines: int = 80):
+async def agent_logs(agent_id: str, lines: int = 100):
     agents = _load_agents()
     if agent_id not in agents:
         raise HTTPException(404)
     agent = agents[agent_id]
     if agent.connection_type == ConnectionType.http_only:
-        return {"logs": [], "error": "SSH not configured for this agent"}
+        return {"logs": [], "error": "SSH not configured"}
     try:
-        raw   = _ssh_run(agent, f"journalctl -u openclaw -n {lines} --no-pager --output=short 2>/dev/null")
+        raw = _ssh_run(agent,
+            f"journalctl -u openclaw -n {lines} --no-pager --output=short-iso 2>/dev/null")
         return {"logs": [l for l in raw.splitlines() if l.strip()]}
     except Exception as exc:
         return {"logs": [], "error": str(exc)}
@@ -531,35 +685,131 @@ async def agent_config(agent_id: str):
     try:
         raw = _ssh_run(agent,
             "cat /home/openclaw/.openclaw/openclaw.json 2>/dev/null "
-            "|| cat ~/.openclaw/openclaw.json 2>/dev/null "
-            "|| echo '{}'")
+            "|| cat ~/.openclaw/openclaw.json 2>/dev/null || echo '{}'")
         try:
             return {"config": json.loads(raw)}
         except Exception:
-            return {"config": None, "raw": raw, "error": "Could not parse config as JSON"}
+            return {"config": None, "raw": raw, "error": "Could not parse as JSON"}
     except Exception as exc:
         return {"config": None, "error": str(exc)}
+
+
+@app.get("/api/agents/{agent_id}/costs")
+async def agent_costs(agent_id: str, days: int = 14):
+    costs = _get_costs(agent_id, days)
+    today = _today_cost(agent_id)
+
+    # Aggregate by day
+    by_day: Dict[str, float] = {}
+    for row in costs:
+        by_day[row["day"]] = by_day.get(row["day"], 0.0) + (row["cost"] or 0.0)
+
+    # Total
+    total = sum(by_day.values())
+
+    return {
+        "today": round(today, 6),
+        "total": round(total, 6),
+        "by_day": [{"day": k, "cost": round(v, 6)} for k, v in sorted(by_day.items())],
+        "detail": costs,
+    }
+
+
+@app.get("/api/agents/{agent_id}/reasoning")
+async def agent_reasoning(agent_id: str):
+    agents = _load_agents()
+    if agent_id not in agents:
+        raise HTTPException(404)
+    agent = agents[agent_id]
+    if agent.connection_type == ConnectionType.http_only:
+        return {"blocks": [], "note": "SSH not configured"}
+    try:
+        raw = _ssh_run(agent,
+            "journalctl -u openclaw -n 500 --no-pager --output=cat 2>/dev/null")
+        lines  = [l for l in raw.splitlines() if l.strip()]
+        blocks = _extract_reasoning(lines)
+        return {"blocks": blocks}
+    except Exception as exc:
+        return {"blocks": [], "error": str(exc)}
+
+
+@app.get("/api/agents/{agent_id}/sessions")
+async def agent_sessions(agent_id: str):
+    agents = _load_agents()
+    if agent_id not in agents:
+        raise HTTPException(404)
+    agent = agents[agent_id]
+
+    # Try gateway API first
+    data = _gateway_fetch(agent, "/api/sessions")
+    if data:
+        return {"sessions": data if isinstance(data, list) else data.get("sessions", []),
+                "source": "gateway"}
+
+    # Fall back to log parsing
+    if agent.connection_type == ConnectionType.http_only or not agent.ssh_password:
+        return {"sessions": [], "source": "none", "note": "Enable SSH for session data"}
+    try:
+        raw  = _ssh_run(agent, "journalctl -u openclaw -n 300 --no-pager --output=cat 2>/dev/null")
+        logs = [l for l in raw.splitlines() if l.strip()]
+        return {"sessions": _parse_sessions_from_logs(logs), "source": "logs"}
+    except Exception as exc:
+        return {"sessions": [], "error": str(exc)}
+
+
+@app.get("/api/agents/{agent_id}/gateway/{path:path}")
+async def gateway_proxy(agent_id: str, path: str):
+    agents = _load_agents()
+    if agent_id not in agents:
+        raise HTTPException(404)
+    data = _gateway_fetch(agents[agent_id], path)
+    if data is None:
+        raise HTTPException(502, "Gateway did not respond")
+    return data
+
+
+@app.get("/api/overview")
+async def overview():
+    agents = _load_agents()
+    total  = len(agents)
+    online = sum(1 for s in _agent_statuses.values() if s.online)
+    today  = datetime.now().strftime("%Y-%m-%d")
+
+    with _db() as c:
+        cost_row = c.execute(
+            "SELECT SUM(cost_usd) as t FROM cost_events WHERE day=?", (today,)).fetchone()
+        total_cost = round(cost_row["t"] or 0.0, 4)
+
+    events = _recent_events(50)
+    return {
+        "total": total,
+        "online": online,
+        "offline": total - online,
+        "cost_today": total_cost,
+        "events": events,
+    }
+
+
+@app.get("/api/events")
+async def events(n: int = 50):
+    return _recent_events(n)
 
 # ---------------------------------------------------------------------------
 # Control actions
 # ---------------------------------------------------------------------------
-
 @app.post("/api/agents/{agent_id}/control")
 async def control_agent(agent_id: str, req: ControlRequest, background_tasks: BackgroundTasks):
     agents = _load_agents()
     if agent_id not in agents:
-        raise HTTPException(404, "Agent not found")
+        raise HTTPException(404)
     if req.action not in ("start", "stop", "restart", "repair", "update"):
         raise HTTPException(400, f"Unknown action: {req.action}")
-
     agent = agents[agent_id]
     if agent.connection_type == ConnectionType.http_only:
-        raise HTTPException(400, "SSH controls not available — connection type is HTTP-only")
-
+        raise HTTPException(400, "SSH controls not available for Watch Only agents")
     pw = agent.ssh_password or req.ssh_password
     if not pw:
         raise HTTPException(400, "SSH password required")
-
     jid = _job_create()
     background_tasks.add_task(_run_control, jid, agent, req.action, pw)
     return {"job_id": jid}
@@ -570,23 +820,16 @@ async def bulk_action(req: BulkRequest, background_tasks: BackgroundTasks):
     agents  = _load_agents()
     targets = {
         aid: a for aid, a in agents.items()
-        if a.connection_type != ConnectionType.http_only
-        and a.ssh_password
+        if a.connection_type != ConnectionType.http_only and a.ssh_password
         and (req.group is None or a.group == req.group)
     }
     if not targets:
         raise HTTPException(400, "No agents with SSH controls in scope")
-
-    jid = _job_create()
-    action_map = {
-        "restart_all": "restart",
-        "stop_all":    "stop",
-        "start_all":   "start",
-    }
+    action_map = {"restart_all":"restart","stop_all":"stop","start_all":"start"}
     act = action_map.get(req.action)
     if not act:
         raise HTTPException(400, f"Unknown bulk action: {req.action}")
-
+    jid = _job_create()
     background_tasks.add_task(_run_bulk, jid, list(targets.values()), act)
     return {"job_id": jid, "count": len(targets)}
 
@@ -597,12 +840,14 @@ async def job_status(job_id: str):
         raise HTTPException(404)
     return _jobs[job_id]
 
-
+# ---------------------------------------------------------------------------
+# WebSockets
+# ---------------------------------------------------------------------------
 @app.websocket("/ws/jobs/{job_id}")
 async def ws_job(websocket: WebSocket, job_id: str):
     await websocket.accept()
     if job_id not in _job_queues:
-        await websocket.send_json({"level": "error", "message": "Job not found"})
+        await websocket.send_json({"level":"error","message":"Job not found"})
         await websocket.close()
         return
     q = _job_queues[job_id]
@@ -614,34 +859,37 @@ async def ws_job(websocket: WebSocket, job_id: str):
             if job.get("status") in ("success", "failed"):
                 while not q.empty():
                     await websocket.send_json(q.get_nowait())
-                await websocket.send_json({
-                    "level": "status",
-                    "status": job["status"],
-                    "error": job.get("error"),
-                })
+                await websocket.send_json({"level":"status","status":job["status"],"error":job.get("error")})
                 break
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.35)
     except WebSocketDisconnect:
         pass
 
-# ---------------------------------------------------------------------------
-# WebSocket: live status stream
-# ---------------------------------------------------------------------------
 
-@app.websocket("/ws/status")
-async def ws_status(websocket: WebSocket):
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    """Main real-time feed: status updates + activity events."""
     await websocket.accept()
+    # Send initial snapshot
+    agents = _load_agents()
     await websocket.send_json({
         "type": "snapshot",
         "statuses": {k: v.model_dump() for k, v in _agent_statuses.items()},
+        "events": _recent_events(40),
+        "agents": [
+            {**a.model_dump(exclude={"ssh_password","gateway_token"}),
+             "has_ssh_password": bool(a.ssh_password),
+             "cost_today": _today_cost(a.id)}
+            for a in agents.values()
+        ],
     })
-    q: queue.Queue = queue.Queue()
+    q: queue.Queue = queue.Queue(maxsize=200)
     _ws_listeners.append(q)
     try:
         while True:
             while not q.empty():
                 await websocket.send_json(q.get_nowait())
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.35)
     except WebSocketDisconnect:
         pass
     finally:
@@ -651,19 +899,14 @@ async def ws_status(websocket: WebSocket):
 # ---------------------------------------------------------------------------
 # Control engine
 # ---------------------------------------------------------------------------
-
 def _run_control(jid: str, agent: AgentRecord, action: str, password: str):
     def info(m): _job_log(jid, m, "info")
     def ok(m):   _job_log(jid, m, "success")
     def warn(m): _job_log(jid, m, "warn")
     def err(m):  _job_log(jid, m, "error")
-
     try:
         _job_update(jid, "running")
-        labels = {"start":"Starting","stop":"Stopping","restart":"Restarting",
-                  "repair":"Repairing","update":"Updating"}
-        info(f"🎼  {labels[action]} {agent.emoji} {agent.name}…")
-
+        info(f"🎼  {action.title()}: {agent.emoji} {agent.name}…")
         if action == "repair":
             _do_repair(agent, password, info, ok, warn, err)
         elif action == "update":
@@ -674,16 +917,15 @@ def _run_control(jid: str, agent: AgentRecord, action: str, password: str):
                     "restart":"systemctl restart openclaw"}
             _ssh_run(agent, cmds[action], password=password, timeout=30)
             time.sleep(3)
-            svc = _ssh_run(agent, "systemctl is-active openclaw 2>/dev/null",
-                           password=password).strip()
+            svc = _ssh_run(agent, "systemctl is-active openclaw 2>/dev/null", password=password).strip()
             if action == "stop":
-                ok(f"✅  {agent.name} has been stopped")
+                ok(f"✅  {agent.name} stopped")
             elif svc == "active":
                 ok(f"✅  {agent.name} is running")
             else:
                 warn(f"⚠️  Service status: {svc}")
-
         _job_update(jid, "success")
+        _log_event(agent.id, "control", f"{action} executed")
         time.sleep(2)
         _refresh_one(agent.id)
     except Exception as exc:
@@ -692,68 +934,58 @@ def _run_control(jid: str, agent: AgentRecord, action: str, password: str):
 
 
 def _do_repair(agent, password, info, ok, warn, err):
-    info("🔍  Checking OpenClaw installation…")
+    info("🔍  Checking installation…")
     which = _ssh_run(agent, "which openclaw 2>/dev/null", password=password).strip()
     if not which:
-        warn("   OpenClaw not found — reinstalling…")
+        warn("   Not found — reinstalling…")
         _ssh_run(agent, "npm install -g openclaw@latest 2>&1", password=password, timeout=600)
-        ok("   ✅  OpenClaw reinstalled")
+        ok("   ✅  Reinstalled")
     else:
-        ok(f"   ✅  OpenClaw found: {which}")
-
+        ok(f"   ✅  Found: {which}")
     svc = _ssh_run(agent, "systemctl cat openclaw 2>/dev/null | head -1", password=password).strip()
     if not svc:
-        warn("   Service file missing — writing it now…")
+        warn("   Service file missing — writing…")
         svc_content = (
             "[Unit]\\nDescription=OpenClaw Gateway\\nAfter=network.target\\n\\n"
-            "[Service]\\nType=simple\\nUser=openclaw\\nWorkingDirectory=/home/openclaw\\n"
+            "[Service]\\nType=simple\\nUser=openclaw\\n"
             "EnvironmentFile=/home/openclaw/.openclaw/.env\\n"
             "ExecStart=/usr/bin/openclaw gateway\\nRestart=always\\nRestartSec=10\\n\\n"
             "[Install]\\nWantedBy=multi-user.target"
         )
-        _ssh_run(agent, f"printf '{svc_content}' > /etc/systemd/system/openclaw.service",
-                 password=password)
-
-    env = _ssh_run(agent, "test -f /home/openclaw/.openclaw/.env && echo yes 2>/dev/null",
-                   password=password).strip()
-    ok("   ✅  Environment file present") if env == "yes" else warn(
-        "   ⚠️  No .env file — API key may be missing")
-
-    info("   Reloading and starting service…")
+        _ssh_run(agent, f"printf '{svc_content}' > /etc/systemd/system/openclaw.service", password=password)
+    info("   Reloading and starting…")
     _ssh_run(agent, "systemctl daemon-reload && systemctl enable openclaw && systemctl start openclaw",
              password=password, timeout=30)
     time.sleep(4)
     final = _ssh_run(agent, "systemctl is-active openclaw 2>/dev/null", password=password).strip()
-    ok(f"\n✅  {agent.name} is healthy!") if final == "active" else warn(
-        f"\n⚠️  Status: {final} — check logs for clues")
+    ok(f"\n✅  {agent.name} is healthy!") if final == "active" else warn(f"\n⚠️  Status: {final}")
 
 
 def _do_update(agent, password, info, ok, warn, err):
-    info("⬆️   Checking current version…")
+    info("⬆️   Checking version…")
     before = _ssh_run(agent, "openclaw --version 2>/dev/null", password=password).strip()
     info(f"   Current: {before or 'unknown'}")
-    info("   Installing latest OpenClaw…")
+    info("   Installing latest…")
     _ssh_run(agent, "npm install -g openclaw@latest 2>&1", password=password, timeout=600)
     after = _ssh_run(agent, "openclaw --version 2>/dev/null", password=password).strip()
-    ok(f"   ✅  Updated: {before} → {after}")
-    info("   Restarting service…")
+    ok(f"   ✅  {before} → {after}")
+    info("   Restarting…")
     _ssh_run(agent, "systemctl restart openclaw", password=password, timeout=30)
     time.sleep(4)
     svc = _ssh_run(agent, "systemctl is-active openclaw 2>/dev/null", password=password).strip()
-    ok(f"✅  {agent.name} updated and running!") if svc == "active" else warn(
-        f"⚠️  Updated but service status: {svc}")
+    ok(f"✅  Updated and running!") if svc == "active" else warn(f"⚠️  Status: {svc}")
 
 
 def _run_bulk(jid: str, agents: List[AgentRecord], action: str):
     _job_update(jid, "running")
     for agent in agents:
-        _job_log(jid, f"🎼  {action.title()}: {agent.emoji} {agent.name}…", "info")
+        _job_log(jid, f"{action.title()}: {agent.emoji} {agent.name}…", "info")
         try:
             cmd = {"start":"systemctl start openclaw",
                    "stop": "systemctl stop openclaw",
                    "restart":"systemctl restart openclaw"}[action]
             _ssh_run(agent, cmd, timeout=30)
-            _job_log(jid, f"   ✅  Done", "success")
+            _job_log(jid, "   ✅  Done", "success")
         except Exception as exc:
             _job_log(jid, f"   ❌  {exc}", "error")
     _job_update(jid, "success")
@@ -765,7 +997,6 @@ def _run_bulk(jid: str, agents: List[AgentRecord], action: str):
 # ---------------------------------------------------------------------------
 # Static files
 # ---------------------------------------------------------------------------
-
 STATIC = Path(__file__).parent / "static"
 if STATIC.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
@@ -773,10 +1004,8 @@ if STATIC.exists():
 
 @app.get("/")
 async def root():
-    index = STATIC / "index.html"
-    return FileResponse(str(index)) if index.exists() else HTMLResponse(
-        "<h1>OpenClaw Orchestra</h1><p>Static files missing.</p>"
-    )
+    idx = STATIC / "index.html"
+    return FileResponse(str(idx)) if idx.exists() else HTMLResponse("<h1>OpenClaw Orchestra</h1>")
 
 # ---------------------------------------------------------------------------
 # Entry-point
